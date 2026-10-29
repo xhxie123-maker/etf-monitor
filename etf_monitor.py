@@ -78,18 +78,24 @@ def log(msg: str):
 
 
 def safe_call(name, fn, *args, **kwargs):
-    """带超时与异常捕获的统一调用，失败返回 None"""
-    try:
-        return fn(*args, **kwargs)
-    except Exception as e:
-        log(f"[数据源] {name} 获取失败: {type(e).__name__}: {str(e)[:120]}")
-        return None
+    """带超时与异常捕获的统一调用，失败返回 None；attempts 控制重试次数"""
+    attempts = int(kwargs.pop("attempts", 1))
+    last = None
+    for i in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last = e
+            log(f"[数据源] {name} 第{i + 1}/{attempts}次获取失败: {type(e).__name__}: {str(e)[:120]}")
+            if i < attempts - 1:
+                time.sleep(2)
+    return None
 
 
 # ============================================================
-# 2. 数据获取
+# 2. 数据获取（东财优先，新浪兜底——海外服务器(如GitHub Actions)访问东财会被拒绝）
 # ============================================================
-def get_etf_daily(code: str):
+def get_etf_daily_em(code: str):
     """ETF 前复权日线（东方财富）"""
     end = dt.date.today().strftime("%Y%m%d")
     start = (dt.date.today() - dt.timedelta(days=int(HISTORY_YEARS * 365))).strftime("%Y%m%d")
@@ -102,7 +108,28 @@ def get_etf_daily(code: str):
     return df
 
 
-def get_index_daily(code: str):
+def get_etf_daily_sina(code: str):
+    """ETF 日线（新浪，海外可访问；新浪接口为不复权数据，仅作东财失败时的兜底）"""
+    prefix = "sh" if str(code).startswith("5") else "sz"
+    df = ak.fund_etf_hist_sina(symbol=f"{prefix}{code}")
+    df = df.rename(columns={"日期": "date", "开盘": "open", "收盘": "close",
+                            "最高": "high", "最低": "low"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["pct_chg"] = df["close"].pct_change() * 100
+    return df
+
+
+def get_etf_daily(code: str):
+    """ETF 日线：东财优先（重试2次），失败自动切新浪"""
+    df = safe_call("东财ETF行情", get_etf_daily_em, code, attempts=2)
+    if df is None:
+        log("东财ETF行情不可用，尝试新浪源")
+        df = safe_call("新浪ETF行情", get_etf_daily_sina, code)
+    return df
+
+
+def get_index_daily_em(code: str):
     """指数日线（东方财富）"""
     end = dt.date.today().strftime("%Y%m%d")
     start = (dt.date.today() - dt.timedelta(days=int(HISTORY_YEARS * 365))).strftime("%Y%m%d")
@@ -112,6 +139,42 @@ def get_index_daily(code: str):
                             "最高": "high", "最低": "low", "涨跌幅": "pct_chg"})
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
+    return df
+
+
+def get_index_daily_sina(code: str):
+    """指数日线（新浪，海外可访问）"""
+    prefix = "sh" if str(code).startswith("000") else "sz"
+    df = ak.stock_zh_index_daily(symbol=f"{prefix}{code}")
+    df = df.rename(columns={"date": "date", "open": "open", "close": "close",
+                            "high": "high", "low": "low"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["pct_chg"] = df["close"].pct_change() * 100
+    return df
+
+
+def get_index_daily_tx(code: str):
+    """指数日线（腾讯，海外可访问，数据新鲜）"""
+    prefix = "sh" if str(code).startswith("000") else "sz"
+    df = ak.stock_zh_index_daily_tx(symbol=f"{prefix}{code}")
+    df = df.rename(columns={"date": "date", "open": "open", "close": "close",
+                            "high": "high", "low": "low"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["pct_chg"] = df["close"].pct_change() * 100
+    return df
+
+
+def get_index_daily(code: str):
+    """指数日线：东财优先，失败依次切新浪、腾讯"""
+    df = safe_call("东财指数行情", get_index_daily_em, code, attempts=2)
+    if df is None:
+        log("东财指数行情不可用，尝试新浪源")
+        df = safe_call("新浪指数行情", get_index_daily_sina, code)
+    if df is None:
+        log("新浪指数行情不可用，尝试腾讯源")
+        df = safe_call("腾讯指数行情", get_index_daily_tx, code)
     return df
 
 
@@ -356,6 +419,8 @@ def build_ratio():
                  on="date", suffixes=("_gem", "_div"))
     m["ratio"] = m["close_gem"] / m["close_div"]
     m = m.dropna()
+    # 仅取近3年样本（与看板“近3年分位”口径一致；腾讯/新浪源返回全量历史）
+    m = m.tail(int(HISTORY_YEARS * 250)).reset_index(drop=True)
     latest = float(m["ratio"].iloc[-1])
     pct = percentile_of(m["ratio"], latest)
     if latest < TH["ratio_low"]:
@@ -634,11 +699,47 @@ DATA.etfs.forEach(e => {{
         return None
 
 
+def render_fallback(meta: dict):
+    """云端容错：全部数据源失败时生成占位看板（保留上一次成功快照不被覆盖）"""
+    if DASHBOARD_PATH.exists():
+        return str(DASHBOARD_PATH)  # 已有历史看板则保留原样
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ETF 智能监测看板（数据暂不可用）</title>
+<style>
+  body {{ background:#0b1020; color:#e6ebf5; font-family:"Microsoft YaHei",system-ui,sans-serif;
+         display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; }}
+  .box {{ text-align:center; max-width:520px; padding:24px; }}
+  h1 {{ font-size:20px; margin-bottom:12px; }}
+  p {{ color:#8a93ab; font-size:14px; line-height:1.8; }}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>ETF 智能监测看板 · 数据暂不可用</h1>
+  <p>本次运行（{meta['gen_time']}）所有行情数据源均获取失败。<br>
+     请稍后在仓库 Actions 页手动「Run workflow」重试。<br>
+     若此前已有看板，将保留上一次成功快照。</p>
+</div>
+</body>
+</html>"""
+    try:
+        DASHBOARD_PATH.write_text(html, encoding="utf-8")
+        return str(DASHBOARD_PATH)
+    except Exception as e:
+        log(f"占位看板写盘失败: {e}")
+        return None
+
+
 # ============================================================
 # 7. 主流程
 # ============================================================
 def main():
     run_at = dt.datetime.now()
+    cloud_mode = "--cloud" in sys.argv  # 云端(GitHub Actions)容错模式
     meta = {"data_date": "--", "gen_time": run_at.strftime("%Y-%m-%d %H:%M:%S"), "badges": []}
     badges = [{"label": "东方财富行情", "ok": True}, {"label": "中证指数官方估值", "ok": True},
               {"label": "估值分位·本地积累", "ok": True}]
@@ -701,7 +802,11 @@ def main():
     meta["badges"] = badges
 
     if not etfs:
-        log("所有标的数据缺失，本次不生成看板")
+        log("所有标的数据缺失，本次不生成新看板")
+        if cloud_mode:
+            path = render_fallback(meta)
+            log(f"云端容错: 保留/生成占位看板 {path}")
+            return 0
         return 1
 
     path = render_dashboard(meta, ratio, etfs)
