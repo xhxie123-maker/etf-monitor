@@ -2,7 +2,7 @@ name: ETF Daily Monitor
 
 on:
   schedule:
-    - cron: "35 7 * * 1-5"   # UTC 07:35 = 北京时间 15:35，周一至周五
+    - cron: '35 7 * * 1-5'   # 北京时间 15:35（UTC 07:35），周一至周五，收盘后
   workflow_dispatch:
 
 permissions:
@@ -11,8 +11,8 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "pages"
-  cancel-in-progress: true
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -21,21 +21,18 @@ jobs:
       TZ: Asia/Shanghai
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
+          python-version: '3.11'
 
-      - name: Install deps
+      - name: Install dependencies
         run: pip install akshare pandas numpy requests
 
       - name: Download ECharts
         run: |
           mkdir -p libs
-          curl -fsSL -o libs/echarts.min.js https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js
+          curl -fsSL -o libs/echarts.min.js https://unpkg.com/echarts@5.5.1/dist/echarts.min.js
 
       - name: Run monitor
         run: python etf_monitor.py --cloud
@@ -48,12 +45,11 @@ jobs:
           git diff --cached --quiet || git commit -m "daily update: $(date +%F)"
           git push
 
-      - name: Prepare pages artifact
+      - name: Prepare Pages artifact
         run: |
-          mkdir -p deploy/output
-          cp output/etf_dashboard.html deploy/output/
-          cp -r libs deploy/output/
-          ls -la deploy/output
+          mkdir -p deploy
+          cp -r output deploy/output
+          cp -r libs deploy/libs
 
       - uses: actions/upload-pages-artifact@v3
         with:
