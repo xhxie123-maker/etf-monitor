@@ -93,7 +93,7 @@ def safe_call(name, fn, *args, **kwargs):
 
 
 # ============================================================
-# 2. 数据获取（东财优先，新浪兜底——海外服务器(如GitHub Actions)访问东财会被拒绝）
+# 2. 数据获取（东财优先，新浪/腾讯兜底——海外服务器(如GitHub Actions)访问东财会被拒绝）
 # ============================================================
 def get_etf_daily_em(code: str):
     """ETF 前复权日线（东方财富）"""
@@ -167,11 +167,15 @@ def get_index_daily_tx(code: str):
 
 
 def get_index_daily(code: str):
-    """指数日线：东财优先，失败依次切新浪、腾讯"""
+    """指数日线：东财优先，失败依次切新浪、腾讯；
+    新浪源部分指数停更（如 000922 只到 2019），过期数据视为失败继续下探"""
     df = safe_call("东财指数行情", get_index_daily_em, code, attempts=2)
     if df is None:
         log("东财指数行情不可用，尝试新浪源")
         df = safe_call("新浪指数行情", get_index_daily_sina, code)
+    if df is not None and df["date"].max() < pd.Timestamp(dt.date.today()) - pd.Timedelta(days=10):
+        log(f"新浪指数行情数据过期(末日期 {df['date'].max().date()})，跳过")
+        df = None
     if df is None:
         log("新浪指数行情不可用，尝试腾讯源")
         df = safe_call("腾讯指数行情", get_index_daily_tx, code)
