@@ -1,0 +1,19 @@
+[2026-10-29 19:00:42] [数据源] 东财指数行情 第1/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:00:53] [数据源] 东财指数行情 第2/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:00:53] 东财指数行情不可用，尝试新浪源
+[2026-10-29 19:01:02] [数据源] 东财指数行情 第1/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:01:14] [数据源] 东财指数行情 第2/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:01:14] 东财指数行情不可用，尝试新浪源
+[2026-10-29 19:01:16] [数据源] 东财ETF行情 第1/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:01:20] [数据源] 东财ETF行情 第2/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:01:20] 东财ETF行情不可用，尝试新浪源
+[2026-10-29 19:01:23] 红利ETF: 收盘 1.361 | PE分位 80.0%(20期) | 结论 逢高减仓
+[2026-10-29 19:01:24] [数据源] 东财ETF行情 第1/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:01:28] [数据源] 东财ETF行情 第2/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:01:28] 东财ETF行情不可用，尝试新浪源
+[2026-10-29 19:01:31] 银行ETF: 收盘 1.444 | PE分位 80.0%(20期) | 结论 逢高减仓
+[2026-10-29 19:01:32] [数据源] 东财ETF行情 第1/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:01:35] [数据源] 东财ETF行情 第2/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:01:35] 东财ETF行情不可用，尝试新浪源
+[2026-10-29 19:01:37] 煤炭ETF: 收盘 1.209 | PE分位 30.0%(20期) | 结论 观望持有
+[2026-10-29 19:01:37] 看板已生成: /home/runner/work/etf-monitor/etf-monitor/output/etf_dashboard.html
