@@ -17,3 +17,24 @@
 [2026-10-29 19:01:35] 东财ETF行情不可用，尝试新浪源
 [2026-10-29 19:01:37] 煤炭ETF: 收盘 1.209 | PE分位 30.0%(20期) | 结论 观望持有
 [2026-10-29 19:01:37] 看板已生成: /home/runner/work/etf-monitor/etf-monitor/output/etf_dashboard.html
+[2026-10-29 19:15:36] [数据源] 东财指数行情 第1/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:15:46] [数据源] 东财指数行情 第2/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:15:46] 东财指数行情不可用，尝试新浪源
+[2026-10-29 19:15:55] [数据源] 东财指数行情 第1/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:16:04] [数据源] 东财指数行情 第2/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:16:04] 东财指数行情不可用，尝试新浪源
+[2026-10-29 19:16:04] 新浪指数行情数据过期(末日期 2019-01-30)，跳过
+[2026-10-29 19:16:04] 新浪指数行情不可用，尝试腾讯源
+[2026-10-29 19:16:26] [数据源] 东财ETF行情 第1/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:16:29] [数据源] 东财ETF行情 第2/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:16:29] 东财ETF行情不可用，尝试新浪源
+[2026-10-29 19:16:32] 红利ETF: 收盘 1.361 | PE分位 80.0%(20期) | 结论 逢高减仓
+[2026-10-29 19:16:33] [数据源] 东财ETF行情 第1/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:16:35] [数据源] 东财ETF行情 第2/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:16:35] 东财ETF行情不可用，尝试新浪源
+[2026-10-29 19:16:39] 银行ETF: 收盘 1.444 | PE分位 80.0%(20期) | 结论 逢高减仓
+[2026-10-29 19:16:39] [数据源] 东财ETF行情 第1/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:16:42] [数据源] 东财ETF行情 第2/2次获取失败: ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-10-29 19:16:42] 东财ETF行情不可用，尝试新浪源
+[2026-10-29 19:16:51] 煤炭ETF: 收盘 1.209 | PE分位 30.0%(20期) | 结论 观望持有
+[2026-10-29 19:16:51] 看板已生成: /home/runner/work/etf-monitor/etf-monitor/output/etf_dashboard.html
