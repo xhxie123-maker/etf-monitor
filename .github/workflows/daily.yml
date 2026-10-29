@@ -2,7 +2,7 @@ name: ETF Daily Monitor
 
 on:
   schedule:
-    - cron: '35 7 * * 1-5'   # 北京时间 15:35（UTC 07:35），周一至周五，收盘后
+    - cron: "35 7 * * 1-5"   # UTC 07:35 = 北京时间 15:35，周一至周五
   workflow_dispatch:
 
 permissions:
@@ -11,8 +11,8 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: "pages"
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -21,35 +21,39 @@ jobs:
       TZ: Asia/Shanghai
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: pip
 
-      - name: Install dependencies
+      - name: Install deps
         run: pip install akshare pandas numpy requests
 
       - name: Download ECharts
         run: |
           mkdir -p libs
-          curl -fsSL -o libs/echarts.min.js https://unpkg.com/echarts@5.5.1/dist/echarts.min.js
+          curl -fsSL -o libs/echarts.min.js https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js
 
       - name: Run monitor
-        run: python etf_monitor.py
+        run: python etf_monitor.py --cloud
 
       - name: Commit valuation history
         run: |
           git config user.name "etf-monitor-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add output/valuation_history.csv output/run_log.txt
+          git add output/valuation_history.csv output/run_log.txt output/etf_dashboard.html
           git diff --cached --quiet || git commit -m "daily update: $(date +%F)"
           git push
 
-      - name: Prepare Pages artifact
+      - name: Prepare pages artifact
         run: |
-          mkdir -p deploy
-          cp -r output deploy/output
-          cp -r libs deploy/libs
+          mkdir -p deploy/output
+          cp output/etf_dashboard.html deploy/output/
+          cp -r libs deploy/output/
+          ls -la deploy/output
 
       - uses: actions/upload-pages-artifact@v3
         with:
