@@ -102,11 +102,14 @@ def safe_call(name, fn, *args, **kwargs):
 # 2. 数据获取（东财优先，新浪兜底——海外服务器(如GitHub Actions)访问东财会被拒绝）
 # ============================================================
 def get_etf_daily_em(code: str):
-    """ETF 前复权日线（东方财富）"""
+    """ETF 日线（东方财富，不复权）。
+
+    说明：不复权为真实成交价，PE 日频回推与做T支撑/压力需真实价格，
+    且与腾讯/新浪兜底源口径统一；代价为分红日出现一次自然跳空。"""
     end = dt.date.today().strftime("%Y%m%d")
     start = (dt.date.today() - dt.timedelta(days=int(PRICE_YEARS * 365))).strftime("%Y%m%d")
     df = ak.fund_etf_hist_em(symbol=code, period="daily",
-                             start_date=start, end_date=end, adjust="qfq")
+                             start_date=start, end_date=end, adjust="")
     df = df.rename(columns={"日期": "date", "开盘": "open", "收盘": "close",
                             "最高": "high", "最低": "low", "涨跌幅": "pct_chg"})
     df["date"] = pd.to_datetime(df["date"])
