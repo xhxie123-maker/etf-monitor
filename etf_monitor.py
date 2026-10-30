@@ -102,19 +102,11 @@ def safe_call(name, fn, *args, **kwargs):
 # 2. 数据获取（东财优先，新浪兜底——海外服务器(如GitHub Actions)访问东财会被拒绝）
 # ============================================================
 def get_etf_daily_em(code: str):
-    """ETF 日线（东方财富，不复权）。
-
-    说明：不复权为真实成交价，PE 日频回推与做T支撑/压力需真实价格，
-    且与腾讯/新浪兜底源口径统一；代价为分红日出现一次自然跳空。"""
+    """ETF 前复权日线（东方财富）"""
     end = dt.date.today().strftime("%Y%m%d")
     start = (dt.date.today() - dt.timedelta(days=int(PRICE_YEARS * 365))).strftime("%Y%m%d")
     df = ak.fund_etf_hist_em(symbol=code, period="daily",
-                             start_date=start, end_date=end, adjust="")
-    df = df.rename(columns={"日期": "date", "开盘": "open", "收盘": "close",
-                            "最高": "high", "最低": "low", "涨跌幅": "pct_chg"})
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    return df
+                             start_date=start, end_date=end, adjust="qfq")
 
 
 def get_etf_daily_sina(code: str):
@@ -263,9 +255,11 @@ def percentile_of(series: pd.Series, value: float) -> float:
 def build_pe_series(price_df, val_latest, acc_hist) -> "pd.Series | None":
     """
     构建日频 PE 序列（估算口径）：
-      官方最新 PE × 收盘价比例回推全历史（假设 EPS 近似恒定），
+      官方最新 PE × 指数点位/收盘价比例回推全历史（假设 EPS 近似恒定），
       官方积累库中的真实 PE 覆盖对应日期（近约20个交易日为官方值），
       末端强制对齐官方最新 PE。
+    注：price_df 应传指数日线（真实点位，无复权问题）；仅指数日线缺失时
+        才允许用 ETF 行情兜底（分位口径会略差）。
     返回 pd.Series(index=日期, name='pe') 升序；数据不足返回 None。
     """
     if price_df is None or price_df.empty or not val_latest or pd.isna(val_latest.get("pe")):
@@ -886,9 +880,15 @@ def main():
             badges[1]["ok"] = False
             badges[2]["ok"] = False
 
-        # 日频 PE 序列（估算口径：官方最新PE × 收盘价比例回推，官方积累库覆盖近期）
+        # 日频 PE 序列（估算口径：官方最新PE × 指数点位比例回推，官方积累库覆盖近期）
+        # 说明：PE 属于指数（000922/399986/000820），指数日线为真实点位、无复权问题；
+        #       ETF 价格受分红/复权因子影响会扭曲 PE 回推，故 PE 序列一律基于指数日线。
+        idx_df = safe_call(f"{cfg['index_name']}指数行情", get_index_daily, cfg["index_code"])
+        if idx_df is None:
+            log(f"{name} 指数日线缺失，PE序列改用ETF行情估算(口径略差)")
+            idx_df = price_df
         sub_acc = hist[hist["index_code"] == cfg["index_code"]]
-        pe_series = build_pe_series(price_df, val_latest, sub_acc)
+        pe_series = build_pe_series(idx_df, val_latest, sub_acc)
         if pe_series is None or len(pe_series) < 250:
             badges[2]["ok"] = False
             log(f"{name} 日频PE序列不足(样本{0 if pe_series is None else len(pe_series)})，分位不可用")
