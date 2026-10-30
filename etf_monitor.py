@@ -93,7 +93,7 @@ def safe_call(name, fn, *args, **kwargs):
 
 
 # ============================================================
-# 2. 数据获取（东财优先，新浪/腾讯兜底——海外服务器(如GitHub Actions)访问东财会被拒绝）
+# 2. 数据获取（东财优先，新浪兜底——海外服务器(如GitHub Actions)访问东财会被拒绝）
 # ============================================================
 def get_etf_daily_em(code: str):
     """ETF 前复权日线（东方财富）"""
@@ -120,11 +120,29 @@ def get_etf_daily_sina(code: str):
     return df
 
 
+def get_etf_daily_tx(code: str):
+    """ETF 日线（腾讯，海外可访问、数据新鲜；接口为不复权数据，仅作东财失败时的兜底）"""
+    prefix = "sh" if str(code).startswith("5") else "sz"
+    df = ak.stock_zh_a_hist_tx(symbol=f"{prefix}{code}")
+    df = df.rename(columns={"date": "date", "open": "open", "close": "close",
+                            "high": "high", "low": "low"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    df["pct_chg"] = df["close"].pct_change() * 100
+    return df
+
+
 def get_etf_daily(code: str):
-    """ETF 日线：东财优先（重试2次），失败自动切新浪"""
+    """ETF 日线：东财优先（重试2次），失败依次切腾讯、新浪（腾讯带新鲜度门槛）"""
     df = safe_call("东财ETF行情", get_etf_daily_em, code, attempts=2)
     if df is None:
-        log("东财ETF行情不可用，尝试新浪源")
+        log("东财ETF行情不可用，尝试腾讯源")
+        df = safe_call("腾讯ETF行情", get_etf_daily_tx, code)
+    if df is not None and df["date"].max() < pd.Timestamp(dt.date.today()) - pd.Timedelta(days=10):
+        log(f"腾讯ETF行情数据过期(末日期 {df['date'].max().date()})，跳过")
+        df = None
+    if df is None:
+        log("腾讯ETF行情不可用，尝试新浪源")
         df = safe_call("新浪ETF行情", get_etf_daily_sina, code)
     return df
 
