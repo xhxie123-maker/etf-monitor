@@ -7,7 +7,8 @@ ETF 智能监测工具
 输出     ：单窗口可视化看板 output/etf_dashboard.html（浏览器打开即看全部）
 用法     ：python etf_monitor.py [--open]
           --open 生成后自动打开浏览器看板
-数据源   ：东方财富(ETF/指数行情)、中证指数官网(官方估值)、本地积累库(估值分位历史)
+数据源   ：东方财富/腾讯/新浪(行情回退链)、中证指数官网(官方估值)、日频PE序列(官方最新PE×价格比估算)
+分位口径 ：近1年/近3年/近5年三窗口滚动分位，主信号取近3年；分位旁标注样本数(交易日)与时间跨度
 说明     ：本工具仅为数据监测与量化参考，不构成投资建议。
 """
 import os
@@ -51,6 +52,11 @@ DIV_INDEX = "000922"
 
 # 历史回看年数（价格类指标分位/均线用）
 HISTORY_YEARS = 3
+# 价格获取窗口（年）：需覆盖最长 PE 分位窗口（近5年≈1250 交易日）
+PRICE_YEARS = 5
+# PE 分位滚动窗口（交易日）：近1年/近3年/近5年
+PE_WINDOWS = {"近1年": 250, "近3年": 750, "近5年": 1250}
+PE_MAIN_WINDOW = "近3年"   # 主信号（估值打分/定投档位/长期仓位）使用的窗口
 # 指数估值来源代码（中证指数官网）
 CSINDEX_MAP = {"000922": "000922", "399986": "399986", "000820": "000820"}
 
@@ -98,7 +104,7 @@ def safe_call(name, fn, *args, **kwargs):
 def get_etf_daily_em(code: str):
     """ETF 前复权日线（东方财富）"""
     end = dt.date.today().strftime("%Y%m%d")
-    start = (dt.date.today() - dt.timedelta(days=int(HISTORY_YEARS * 365))).strftime("%Y%m%d")
+    start = (dt.date.today() - dt.timedelta(days=int(PRICE_YEARS * 365))).strftime("%Y%m%d")
     df = ak.fund_etf_hist_em(symbol=code, period="daily",
                              start_date=start, end_date=end, adjust="qfq")
     df = df.rename(columns={"日期": "date", "开盘": "open", "收盘": "close",
@@ -150,7 +156,7 @@ def get_etf_daily(code: str):
 def get_index_daily_em(code: str):
     """指数日线（东方财富）"""
     end = dt.date.today().strftime("%Y%m%d")
-    start = (dt.date.today() - dt.timedelta(days=int(HISTORY_YEARS * 365))).strftime("%Y%m%d")
+    start = (dt.date.today() - dt.timedelta(days=int(PRICE_YEARS * 365))).strftime("%Y%m%d")
     df = ak.index_zh_a_hist(symbol=code, period="daily",
                             start_date=start, end_date=end)
     df = df.rename(columns={"日期": "date", "开盘": "open", "收盘": "close",
@@ -251,6 +257,64 @@ def percentile_of(series: pd.Series, value: float) -> float:
     return float((s < value).sum() / len(s) * 100)
 
 
+def build_pe_series(price_df, val_latest, acc_hist) -> "pd.Series | None":
+    """
+    构建日频 PE 序列（估算口径）：
+      官方最新 PE × 收盘价比例回推全历史（假设 EPS 近似恒定），
+      官方积累库中的真实 PE 覆盖对应日期（近约20个交易日为官方值），
+      末端强制对齐官方最新 PE。
+    返回 pd.Series(index=日期, name='pe') 升序；数据不足返回 None。
+    """
+    if price_df is None or price_df.empty or not val_latest or pd.isna(val_latest.get("pe")):
+        return None
+    pe0 = float(val_latest["pe"])
+    p = price_df[["date", "close"]].dropna().sort_values("date")
+    if len(p) < 10:
+        return None
+    # 锚点：估值日期（官方/积累库最近一期）对应的收盘价；缺失时用最新收盘价
+    try:
+        anchor = pd.to_datetime(val_latest.get("date") or p["date"].iloc[-1])
+    except Exception:
+        anchor = p["date"].iloc[-1]
+    sub = p[p["date"] <= anchor]
+    anchor_close = float(sub["close"].iloc[-1]) if not sub.empty else float(p["close"].iloc[-1])
+    if not anchor_close or anchor_close <= 0:
+        return None
+    pe_s = pd.Series((pe0 * p["close"] / anchor_close).values,
+                     index=pd.DatetimeIndex(p["date"]), name="pe")
+    # 官方真实 PE 覆盖（积累库含中证官网近20期）
+    if acc_hist is not None and not acc_hist.empty:
+        acc = acc_hist.dropna(subset=["pe"])
+        for _, row in acc.iterrows():
+            d = pd.to_datetime(row["date"])
+            if d in pe_s.index:
+                pe_s.loc[d] = float(row["pe"])
+    pe_s.iloc[-1] = pe0  # 末端对齐官方最新 PE，保证“最新分位=官方值位置”
+    return pe_s
+
+
+def calc_pe_windows(pe_s: "pd.Series | None"):
+    """
+    三窗口（近1年/近3年/近5年）PE 分位。
+    返回 {窗口名: {pct, n, start, end}}；窗口样本不足返回 None；无数据返回 None。
+    """
+    if pe_s is None or len(pe_s) == 0:
+        return None
+    out = {}
+    for label, n in PE_WINDOWS.items():
+        w = pe_s.tail(n)
+        if w.empty:
+            out[label] = None
+            continue
+        out[label] = {
+            "pct": round(percentile_of(w, float(w.iloc[-1])), 1),
+            "n": int(len(w)),
+            "start": str(w.index[0].date()),
+            "end": str(w.index[-1].date()),
+        }
+    return out
+
+
 # ============================================================
 # 4. 估值历史积累库
 # ============================================================
@@ -311,13 +375,24 @@ def get_valuation(code: str, name: str, hist: pd.DataFrame):
 # ============================================================
 # 5. 信号引擎
 # ============================================================
-def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe_hist: pd.DataFrame):
-    """返回该 ETF 的全部指标、信号、建议"""
+def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe_series: "pd.Series | None"):
+    """返回该 ETF 的全部指标、信号、建议。pe_series 为日频 PE 序列（估算口径）"""
     last = price.iloc[-1]
     pe = val_latest.get("pe") if val_latest else np.nan
     pb = val_latest.get("pb") if val_latest else np.nan
     dy = val_latest.get("dy") if val_latest else np.nan
-    pe_pct = percentile_of(pe_hist["pe"], pe) if val_latest and not pe_hist.empty else np.nan
+    pe_windows = calc_pe_windows(pe_series)
+    w_main = pe_windows.get(PE_MAIN_WINDOW) if pe_windows else None
+    pe_pct = w_main["pct"] if w_main else np.nan  # 主信号分位（近3年）
+    pe_pcts, pe_dates = [], []
+    if pe_series is not None and len(pe_series) > 1:
+        # 近3年滚动窗口分位走势（750 交易日窗口逐点）
+        v = pe_series.tail(1250)
+        idx = v.index
+        for i in range(len(v)):
+            w = v.iloc[max(0, i - (PE_WINDOWS[PE_MAIN_WINDOW] - 1)): i + 1]
+            pe_pcts.append(round(percentile_of(w, float(v.iloc[i])), 1))
+            pe_dates.append(str(idx[i].date()))
 
     score = 0.0
     signals = []
@@ -325,11 +400,11 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
     # ---- 估值 ----
     if not np.isnan(pe_pct):
         if pe_pct < TH["pe_low"]:
-            score += 2; signals.append(f"估值低估·PE分位{pe_pct:.0f}%")
+            score += 2; signals.append(f"估值低估·3年分位{pe_pct:.0f}%")
         elif pe_pct > TH["pe_high"]:
-            score -= 2; signals.append(f"估值高估·PE分位{pe_pct:.0f}%")
+            score -= 2; signals.append(f"估值高估·3年分位{pe_pct:.0f}%")
         else:
-            signals.append(f"估值中性·PE分位{pe_pct:.0f}%")
+            signals.append(f"估值中性·3年分位{pe_pct:.0f}%")
 
     # ---- 技术面 ----
     rsi = float(last.get("rsi")) if not np.isnan(last.get("rsi")) else np.nan
@@ -420,7 +495,8 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
         "pb": None if np.isnan(pb) else round(float(pb), 2),
         "dy": None if np.isnan(dy) else round(float(dy), 2),
         "pe_pct": None if np.isnan(pe_pct) else round(pe_pct, 1),
-        "pe_samples": int(len(pe_hist)) if not pe_hist.empty else 0,
+        "pe_windows": pe_windows,   # {近1年/近3年/近5年: {pct,n,start,end}}
+        "pe_pcts": pe_pcts, "pe_dates": pe_dates,
         "signals": signals,
         "score": round(score, 1),
         "conclusion": conclusion, "concl_color": concl_color, "concl_txt": concl_txt,
@@ -505,6 +581,8 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list):
   .up {{ color:var(--red); }} .down {{ color:var(--green); }}
   .kv {{ display:grid; grid-template-columns:1fr 1fr; gap:6px 14px; margin:10px 0; font-size:13px; }}
   .kv .k {{ color:var(--sub); }} .kv .v {{ font-weight:600; }}
+  .wins {{ font-size:11px; color:var(--sub); font-weight:400; line-height:1.55; margin-top:2px; }}
+  .wins b {{ color:var(--text); font-weight:600; }}
   .chips {{ display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }}
   .chip {{ font-size:12px; padding:2px 8px; border-radius:10px; border:1px solid var(--line); color:var(--sub); }}
   .banner {{ border-radius:8px; padding:8px 10px; font-size:13px; font-weight:700; margin:6px 0; }}
@@ -562,12 +640,12 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list):
   <!-- 价格走势 -->
   <div class="price-charts" id="price-charts"></div>
 
-  <!-- 估值分位走势（本地积累） -->
+  <!-- 估值分位走势（近3年滚动窗口） -->
   <div class="pe-charts" id="pe-charts"></div>
 
   <!-- 操作纪律 -->
   <div class="rules">
-    <div class="card"><h3>定投纪律</h3><ul class="mini" style="list-style:none">
+    <div class="card"><h3>定投纪律 <span style="font-size:11px;color:var(--sub);font-weight:400">（按近3年PE分位）</span></h3><ul class="mini" style="list-style:none">
       <li>· PE分位&lt;20%：双倍定投</li>
       <li>· PE分位20%~40%：正常定投</li>
       <li>· PE分位40%~70%：减半定投</li>
@@ -588,9 +666,10 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list):
   </div>
 
   <div class="foot">
-    数据来源：东方财富（行情）· 中证指数官网（官方估值）· 本地积累库（估值分位）<br>
-    本工具仅作数据监测与量化参考，不构成投资建议。市场有风险，投资需谨慎。<br>
-    估值分位样本随每日运行持续积累，样本越多分位越可靠。
+    数据来源：东方财富/腾讯/新浪（行情）· 中证指数官网（官方估值）· 日频PE序列（估算）<br>
+    PE分位口径：近1年250交易日 / 近3年750 / 近5年1250，样本数为窗口内实际交易日；主信号取近3年。<br>
+    PE 历史序列为估算口径（官方最新PE × 收盘价比例回推，近约20个交易日为官方真实值），分位供相对估值参考。<br>
+    本工具仅作数据监测与量化参考，不构成投资建议。市场有风险，投资需谨慎。
   </div>
 </div>
 
@@ -633,9 +712,16 @@ function fmtNum(v, d=2) {{ return v===null||v===undefined ? '--' : Number(v).toF
 const cardsEl = document.getElementById('etf-cards');
 DATA.etfs.forEach(e => {{
   const up = e.pct_chg >= 0;
-  const peInfo = e.pe_pct!==null
-    ? `PE ${{fmtNum(e.pe)}} · 分位 <b>${{e.pe_pct}}%</b>（样本${{e.pe_samples}}期）`
+  const w = e.pe_windows || null;
+  const w1 = w && w['近1年'] ? w['近1年'] : null;
+  const w3 = w && w['近3年'] ? w['近3年'] : null;
+  const w5 = w && w['近5年'] ? w['近5年'] : null;
+  const peInfo = w1
+    ? `PE ${{fmtNum(e.pe)}} · 1年 <b>${{w1.pct}}%</b> / 3年 <b>${{w3.pct}}%</b> / 5年 <b>${{w5.pct}}%</b>`
     : `PE ${{fmtNum(e.pe)}} · 分位 积累中`;
+  const peSamples = w1
+    ? `<div class="wins"><span>近1年 样本 <b>${{w1.n}}</b> 期 · ${{w1.start}}~${{w1.end}}</span><span>近3年 样本 <b>${{w3.n}}</b> 期 · ${{w3.start}}~${{w3.end}}</span><span>近5年 样本 <b>${{w5.n}}</b> 期 · ${{w5.start}}~${{w5.end}}</span></div>`
+    : '--';
   const supp = e.support.length ? e.support.map(x=>fmtNum(x,3)).join(' / ') : '--';
   const pres = e.pressure.length ? e.pressure.map(x=>fmtNum(x,3)).join(' / ') : '--';
   cardsEl.insertAdjacentHTML('beforeend', `
@@ -646,6 +732,7 @@ DATA.etfs.forEach(e => {{
         <span style="font-size:12px;color:var(--sub)">${{e.latest_date}}</span></div>
       <div class="kv">
         <span class="k">PE / 分位</span><span class="v">${{peInfo}}</span>
+        <span class="k">分位样本</span><span class="v">${{peSamples}}</span>
         <span class="k">股息率</span><span class="v">${{e.dy!==null?e.dy+'%':'--'}}</span>
         <span class="k">RSI(14)</span><span class="v">${{fmtNum(e.rsi,0)}}</span>
         <span class="k">MA20 / MA60</span><span class="v">${{fmtNum(e.ma20,3)}} / ${{fmtNum(e.ma60,3)}}</span>
@@ -695,7 +782,7 @@ DATA.etfs.forEach(e => {{
   const div = document.createElement('div');
   div.className = 'card';
   div.style.borderTop = '3px solid ' + e.color;
-  div.innerHTML = `<h3>${{e.name}} 估值分位走势 <span class="code">PE历史百分位·本地积累</span></h3>
+  div.innerHTML = `<h3>${{e.name}} 估值分位走势 <span class="code">PE分位·近3年滚动窗口(750交易日)</span></h3>
     <div class="chart" style="height:170px" id="pe-${{e.code}}"></div>`;
   peEl.appendChild(div);
   const chart = echarts.init(document.getElementById('pe-' + e.code));
@@ -706,7 +793,8 @@ DATA.etfs.forEach(e => {{
     xAxis:{{type:'category',data:e.pe_dates,axisLabel:{{show:false}}}},
     yAxis:{{type:'value',min:0,max:100,axisLabel:{{color:'#8a93ab',fontSize:10,formatter:'{{value}}%'}},
             splitLine:{{lineStyle:{{color:'#232c46'}}}}}},
-    series:[{{type:'bar',data:e.pe_pcts,itemStyle:{{color:'rgba(148,163,184,0.55)',borderRadius:[2,2,0,0]}}}}]
+    series:[{{type:'line',data:e.pe_pcts,symbol:'none',lineStyle:{{color:'rgba(148,163,184,0.85)',width:1}},
+             areaStyle:{{color:'rgba(148,163,184,0.12)'}}}}]
   }});
   window.addEventListener('resize', () => chart.resize());
 }});
@@ -764,7 +852,7 @@ def main():
     cloud_mode = "--cloud" in sys.argv  # 云端(GitHub Actions)容错模式
     meta = {"data_date": "--", "gen_time": run_at.strftime("%Y-%m-%d %H:%M:%S"), "badges": []}
     badges = [{"label": "东方财富行情", "ok": True}, {"label": "中证指数官方估值", "ok": True},
-              {"label": "估值分位·本地积累", "ok": True}]
+              {"label": "估值分位·日频估算(3Y)", "ok": True}]
 
     # ---- 风格轮动：创业板红利比 ----
     ratio = build_ratio()
@@ -789,14 +877,20 @@ def main():
 
         val_latest, pe_hist_df, v_src = get_valuation(cfg["index_code"], cfg["index_name"], hist)
         hist = pe_hist_df  # 保持全局历史
-        if "本地积累" in v_src:
-            badges[2]["ok"] = False
-            badges[1]["ok"] = False
+        if "官网" not in v_src:
+            badges[1]["ok"] = False  # 本次未取到官方估值（沿用积累库/上次数据）
         if "暂无" in v_src:
             badges[1]["ok"] = False
             badges[2]["ok"] = False
 
-        sig = build_signal(name, cfg, price_df, val_latest, hist[hist["index_code"] == cfg["index_code"]])
+        # 日频 PE 序列（估算口径：官方最新PE × 收盘价比例回推，官方积累库覆盖近期）
+        sub_acc = hist[hist["index_code"] == cfg["index_code"]]
+        pe_series = build_pe_series(price_df, val_latest, sub_acc)
+        if pe_series is None or len(pe_series) < 250:
+            badges[2]["ok"] = False
+            log(f"{name} 日频PE序列不足(样本{0 if pe_series is None else len(pe_series)})，分位不可用")
+
+        sig = build_signal(name, cfg, price_df, val_latest, pe_series)
         # 图表数据
         tail = price_df.tail(250)
         sig["dates"] = [str(d.date()) for d in tail["date"]]
@@ -805,20 +899,13 @@ def main():
         sig["ma60s"] = [None if pd.isna(x) else round(float(x), 4) for x in tail["ma60"]]
         sig["boll_ups"] = [None if pd.isna(x) else round(float(x), 4) for x in tail["boll_up"]]
         sig["boll_lows"] = [None if pd.isna(x) else round(float(x), 4) for x in tail["boll_low"]]
-        # 估值分位序列
-        sub = hist[hist["index_code"] == cfg["index_code"]].sort_values("date").reset_index(drop=True)
-        if len(sub) > 1:
-            pcts, dates = [], []
-            for i in range(len(sub)):
-                if pd.notna(sub.loc[i, "pe"]):
-                    pcts.append(round(percentile_of(sub["pe"].iloc[:i + 1], sub.loc[i, "pe"]), 1))
-                    dates.append(str(sub.loc[i, "date"])[:10])
-            sig["pe_pcts"] = pcts
-            sig["pe_dates"] = dates
-        else:
-            sig["pe_pcts"], sig["pe_dates"] = [], []
         etfs.append(sig)
-        log(f"{name}: 收盘 {sig['close']:.3f} | PE分位 {sig['pe_pct']}%({sig['pe_samples']}期) | 结论 {sig['conclusion']}")
+        w = sig.get("pe_windows") or {}
+        p1 = w.get("近1年") or {}
+        p3 = w.get("近3年") or {}
+        p5 = w.get("近5年") or {}
+        log(f"{name}: 收盘 {sig['close']:.3f} | PE {sig['pe']} 分位 1Y {p1.get('pct')}% / "
+            f"3Y {p3.get('pct')}% / 5Y {p5.get('pct')}% (n={p1.get('n')}/{p3.get('n')}/{p5.get('n')}) | 结论 {sig['conclusion']}")
 
     meta["data_date"] = "/".join(sorted(data_dates)) if data_dates else "--"
     meta["badges"] = badges
