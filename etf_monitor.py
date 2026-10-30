@@ -68,6 +68,17 @@ TH = {
     "ratio_low": 0.35, "ratio_high": 0.60 # 创业板红利比 阈值
 }
 
+# 宏观环境阈值（可自行调整）
+MACRO_TH = {
+    "y10_low": 2.0, "y10_high": 2.8,   # 10Y国债收益率%：<2.0 宽松支撑红利 / >2.8 偏紧
+    "mkt_hi": 1.2, "mkt_lo": 0.8,      # 两市成交额较20日均量：>1.2 放量 / <0.8 缩量
+}
+# 政策风向：无法自动抓取定性政策，每周手动更新此条目（看板原样展示）
+MACRO_POLICY = {
+    "title": "政策风向（手动维护）",
+    "text": "当前无新增重大政策信号；关注点：LPR 利率走向、财政发力节奏、行业监管动态。",
+}
+
 REQUEST_TIMEOUT = 20
 
 # ============================================================
@@ -227,8 +238,9 @@ def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
     delta = df["close"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = (-delta).where(delta < 0, 0.0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
+    # RSI(14) Wilder 平滑：ewm(alpha=1/14, adjust=False) 近似 SMMA（标准 RSI 口径）
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
     rs = avg_gain / avg_loss
     df["rsi"] = 100 - (100 / (1 + rs))
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
@@ -467,9 +479,10 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
     pressure.append(round(recent_high, 4))
     t_text = ""
     if not np.isnan(rsi):
-        if rsi > 70:
+        # 阈值与信号段统一（TH["rsi_low"]/TH["rsi_high"]），避免两处口径不一致
+        if rsi > TH["rsi_high"]:
             t_text = "高位慎追，做T以减仓为主"
-        elif rsi < 30:
+        elif rsi < TH["rsi_low"]:
             t_text = "超跌区，做T可留意低吸反抽"
         else:
             t_text = "中性区，箱体内高抛低吸"
@@ -502,6 +515,77 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
         "long_txt": long_txt,
         "latest_date": str(price["date"].iloc[-1].date()),
     }
+
+
+# ============================================================
+# 5. 宏观环境（利率 / 政策 / 情绪）
+# ============================================================
+def get_mkt_amount():
+    """两市成交额序列（上证000001 + 深证成指399001，腾讯指数日线 amount，单位：千元）。
+    海外环境（GitHub Actions）腾讯通道可用；失败返回 None 不阻塞主流程。"""
+    try:
+        a = ak.stock_zh_index_daily_tx(symbol="sh000001")
+        b = ak.stock_zh_index_daily_tx(symbol="sz399001")
+        da, db = a.sort_values("date"), b.sort_values("date")
+        m = pd.merge(da[["date", "amount"]], db[["date", "amount"]],
+                     on="date", suffixes=("_a", "_b"))
+        m["total"] = m["amount_a"] + m["amount_b"]
+        return m[["date", "total"]]
+    except Exception as e:
+        log(f"[数据源] 两市成交额获取失败: {type(e).__name__}: {str(e)[:120]}")
+        return None
+
+
+def get_macro() -> dict:
+    """宏观环境采集：
+    利率 = 中国10Y国债收益率（英为财情）+ 较约20日前变化(bp)
+    政策 = LPR(1Y/5Y，央行) + 手动维护条目 MACRO_POLICY
+    情绪 = 两市成交额（上证+深证，腾讯）及其较20日均量比
+    任一失败仅置 None，看板显示 '--'，不影响 ETF 主流程。"""
+    m = {"y10": None, "y10_chg": None, "y10_label": None, "y10_date": None,
+         "lpr1": None, "lpr5": None,
+         "mkt": None, "mkt_ratio": None, "mkt_date": None, "ok": True}
+
+    # ---- 利率环境：10Y 国债收益率 ----
+    try:
+        d = ak.bond_zh_us_rate(start_date=(dt.date.today() - dt.timedelta(days=120)).strftime("%Y%m%d"))
+        d = d.dropna(subset=["中国国债收益率10年"]).sort_values("日期").reset_index(drop=True)
+        if len(d) >= 2:
+            y = float(d["中国国债收益率10年"].iloc[-1])
+            base = float(d["中国国债收益率10年"].iloc[-21]) if len(d) > 21 else float(d["中国国债收益率10年"].iloc[0])
+            m["y10"], m["y10_chg"] = y, (y - base) * 100  # bp
+            m["y10_date"] = str(d["日期"].iloc[-1])
+            if y < MACRO_TH["y10_low"]:
+                m["y10_label"] = "低利率·宽松（利好红利/高股息）"
+            elif y > MACRO_TH["y10_high"]:
+                m["y10_label"] = "高利率·偏紧（压制估值）"
+            else:
+                m["y10_label"] = "利率中性"
+    except Exception as e:
+        log(f"[数据源] 10Y国债收益率获取失败: {type(e).__name__}: {str(e)[:120]}")
+
+    # ---- 政策风向：LPR（自动硬指标）+ 手动条目 ----
+    try:
+        d = ak.macro_china_lpr()
+        d = d.sort_values("TRADE_DATE")
+        m["lpr1"] = float(d["LPR1Y"].iloc[-1])
+        m["lpr5"] = float(d["LPR5Y"].iloc[-1])
+    except Exception as e:
+        log(f"[数据源] LPR获取失败: {type(e).__name__}: {str(e)[:120]}")
+
+    # ---- 市场情绪：两市成交额 ----
+    try:
+        mm = get_mkt_amount()
+        if mm is not None and len(mm) >= 21:
+            last = float(mm["total"].iloc[-1])
+            avg20 = float(mm["total"].iloc[-21:].mean())
+            m["mkt"] = last
+            m["mkt_ratio"] = last / avg20 if avg20 > 0 else None
+            m["mkt_date"] = str(mm["date"].iloc[-1])
+    except Exception as e:
+        log(f"[数据源] 市场情绪采集失败: {type(e).__name__}: {str(e)[:120]}")
+
+    return m
 
 
 def build_ratio():
@@ -537,12 +621,13 @@ def build_ratio():
 # ============================================================
 # 6. 看板生成（单窗口 HTML）
 # ============================================================
-def render_dashboard(meta: dict, ratio: dict, etfs: list):
+def render_dashboard(meta: dict, ratio: dict, etfs: list, macro: dict = None):
     echarts_src = "../libs/echarts.min.js"
     payload = {
         "meta": meta,
         "ratio": ratio,
         "etfs": etfs,
+        "macro": macro if macro else {},
         "th": TH,
     }
     payload_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
@@ -592,6 +677,14 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list):
   .ratio-bar {{ height:8px; border-radius:4px; margin:8px 0;
                 background:linear-gradient(90deg,#22c55e 0%,#22c55e 30%,#eab308 30%,#eab308 60%,#ef4444 60%,#ef4444 100%); }}
   .ratio-mark {{ display:flex; justify-content:space-between; font-size:11px; color:var(--sub); }}
+  .macro-card {{ grid-column:span 3; }}
+  .macro-row {{ display:flex; gap:14px; flex-wrap:wrap; }}
+  .macro-item {{ flex:1; min-width:200px; background:rgba(255,255,255,0.03); border:1px solid var(--line);
+                 border-radius:8px; padding:10px 12px; }}
+  .macro-item .k {{ display:block; color:var(--sub); font-size:11px; margin-bottom:5px; }}
+  .macro-item .v {{ font-weight:600; font-size:13px; line-height:1.6; }}
+  .macro-item .v.ok {{ color:#4ade80; }} .macro-item .v.warn {{ color:#fbbf24; }}
+  .macro-note {{ margin-top:8px; }}
   .etf-grid {{ grid-template-columns:repeat(3,1fr); }}
   .price-charts {{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:14px; }}
   .tall {{ height:300px; }}
@@ -600,7 +693,7 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list):
   .rules {{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:14px; }}
   .rules li {{ margin-left:16px; }}
   @media (max-width:900px) {{ .grid,.etf-grid,.price-charts,.pe-charts,.rules {{ grid-template-columns:1fr; }}
-      .ratio-card {{ grid-column:span 1; }} }}
+      .ratio-card,.macro-card {{ grid-column:span 1; }} }}
 </style>
 </head>
 <body>
@@ -611,6 +704,19 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list):
       <div class="sub">红利 515180 · 银行 516310 · 煤炭 515220 ｜ 数据日期 {meta['data_date']} ｜ 生成 {meta['gen_time']}</div>
     </div>
     <div class="badges" id="badges"></div>
+  </div>
+
+  <!-- 宏观环境：利率 / 政策 / 情绪 -->
+  <div class="grid">
+  <div class="card macro-card">
+    <h3>宏观环境 <span class="code">利率环境 · 政策风向 · 市场情绪 ｜ 每日自动更新</span></h3>
+    <div class="macro-row">
+      <div class="macro-item"><span class="k">利率环境</span><span class="v" id="macro-rate">--</span></div>
+      <div class="macro-item"><span class="k">政策风向</span><span class="v" id="macro-policy">--</span></div>
+      <div class="macro-item"><span class="k">市场情绪</span><span class="v" id="macro-mkt">--</span></div>
+    </div>
+    <div class="mini macro-note" id="macro-note"></div>
+  </div>
   </div>
 
   <!-- 创业板红利比 -->
@@ -663,9 +769,10 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list):
   </div>
 
   <div class="foot">
-    数据来源：东方财富/腾讯/新浪（行情）· 中证指数官网（官方估值）· 日频PE序列（估算）<br>
+    数据来源：东方财富/腾讯/新浪（行情）· 中证指数官网（官方估值）· 英为财情（国债利率）· 央行（LPR）· 腾讯指数（两市成交）<br>
     PE分位口径：近1年250交易日 / 近3年750 / 近5年1250，样本数为窗口内实际交易日；主信号取近3年。<br>
-    PE 历史序列为估算口径（官方最新PE × 收盘价比例回推，近约20个交易日为官方真实值），分位供相对估值参考。<br>
+    PE 历史序列为估算口径（官方最新PE × 指数点位比例回推，近约20个交易日为官方真实值），分位供相对估值参考。<br>
+    宏观指标为每日自动采集（利率/情绪）与手动维护条目（政策风向）的组合，仅供环境参考。<br>
     本工具仅作数据监测与量化参考，不构成投资建议。市场有风险，投资需谨慎。
   </div>
 </div>
@@ -676,6 +783,41 @@ const DATA = {payload_json};
 /* 徽章：数据源状态 */
 const badges = DATA.meta.badges.map(b => `<span class="badge ${{b.ok?'ok':'warn'}}">${{b.label}}</span>`).join('');
 document.getElementById('badges').innerHTML = badges;
+
+/* 宏观环境：利率 / 政策 / 情绪 */
+(function () {{
+  const M = DATA.macro || {{}};
+  const el = (id) => document.getElementById(id);
+  const y10 = M.y10 !== null && M.y10 !== undefined;
+  if (y10) {{
+    el('macro-rate').innerHTML = '10Y国债 <b>' + M.y10.toFixed(2) + '%</b>（' + (M.y10_chg>=0?'+':'') + M.y10_chg.toFixed(0) + 'bp 较20日前 · ' + M.y10_date + '）';
+    const r = el('macro-rate');
+    r.classList.add(M.y10_label && M.y10_label.indexOf('宽松')>=0 ? 'ok' : (M.y10_label && M.y10_label.indexOf('偏紧')>=0 ? 'warn' : ''));
+  }} else {{
+    el('macro-rate').textContent = '10Y国债 --（数据暂缺）';
+  }}
+  const pol = [];
+  if (M.lpr1 !== null && M.lpr1 !== undefined) pol.push('LPR 1Y <b>' + M.lpr1.toFixed(1) + '%</b> / 5Y <b>' + M.lpr5.toFixed(1) + '%</b>');
+  if (pol.length) el('macro-policy').innerHTML = pol.join(' ｜ ');
+  else el('macro-policy').textContent = 'LPR --（数据暂缺）';
+  const mk = M.mkt !== null && M.mkt !== undefined;
+  if (mk) {{
+    const yiyuan = (M.mkt/1e5).toFixed(0);          // 千元→亿元
+    const wanYi = (M.mkt/1e9).toFixed(2);           // 千元→万亿元
+    const rt = M.mkt_ratio;
+    let lab = '平稳', cls = '';
+    if (rt !== null && rt !== undefined) {{
+      if (rt >= 1.2) {{ lab = '放量(' + rt.toFixed(2) + 'x20日均)'; cls = 'warn'; }}
+      else if (rt <= 0.8) {{ lab = '缩量(' + rt.toFixed(2) + 'x20日均)'; cls = 'ok'; }}
+      else lab = '平稳(' + rt.toFixed(2) + 'x20日均)';
+    }}
+    el('macro-mkt').innerHTML = '两市成交约 <b>' + wanYi + '万亿</b>（' + yiyuan + '亿 · ' + M.mkt_date + '）· ' + lab;
+    if (cls) el('macro-mkt').classList.add(cls);
+  }} else {{
+    el('macro-mkt').textContent = '两市成交 --（数据暂缺）';
+  }}
+  el('macro-note').textContent = '利率/情绪为自动采集口径；政策风向为手动维护条目（每周更新）——详见操作纪律与README。';
+}})();
 
 /* 创业板红利比 */
 const R = DATA.ratio;
@@ -921,7 +1063,7 @@ def main():
             return 0
         return 1
 
-    path = render_dashboard(meta, ratio, etfs)
+    path = render_dashboard(meta, ratio, etfs, macro=get_macro())
     if path is None:
         return 1
     log(f"看板已生成: {path}")
