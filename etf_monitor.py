@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-ETF 智能监测工具
-================
+ETF 智能监测工具（V3）
+=====================
 监测标的：515180 红利ETF / 516310 银行ETF / 515220 煤炭ETF
-核心指标：价格趋势(MA20/MA60/BOLL/RSI)、指数估值分位、创业板红利比
+核心指标：价格趋势(MA20/MA60/MA120/BOLL/RSI)、指数估值分位、创业板红利比、
+         风险指标(ATR/ADX/波动率/回撤)、交易决策简报(趋势×估值×风险三维)
 输出     ：单窗口可视化看板 output/etf_dashboard.html（浏览器打开即看全部）
 用法     ：python etf_monitor.py [--open]
           --open 生成后自动打开浏览器看板
 数据源   ：东方财富/腾讯/新浪(行情回退链)、中证指数官网(官方估值)、日频PE序列(官方最新PE×价格比估算)
 分位口径 ：近1年/近3年/近5年三窗口滚动分位，主信号取近3年；分位旁标注样本数(交易日)与时间跨度
+V3 决策  ：估值维度仅使用积累库官方PE(≥200条)参与决策，样本不足标注"数据不足"不硬算；
+          长期趋势向下或风险过高时不因RSI超卖/PE低估给强烈买入；
+          看板含综合评分(0-100)、数据完整度、分批建仓纪律、ATR参考价位。
 说明     ：本工具仅为数据监测与量化参考，不构成投资建议。
 """
 import os
@@ -23,6 +27,8 @@ import pandas as pd
 import requests
 
 import akshare as ak
+
+import decision_engine
 
 # ============================================================
 # 0. 配置区
@@ -399,15 +405,20 @@ def get_valuation(code: str, name: str, hist: pd.DataFrame):
 # ============================================================
 # 5. 信号引擎
 # ============================================================
-def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe_series: "pd.Series | None"):
-    """返回该 ETF 的全部指标、信号、建议。pe_series 为日频 PE 序列（估算口径）"""
+def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict,
+                 pe_series: "pd.Series | None", pe_hist_official: "pd.DataFrame | None" = None):
+    """
+    返回该 ETF 的全部指标、信号、建议。
+    pe_series: 日频 PE 序列（估算口径，仅展示）
+    pe_hist_official: 该指数积累库官方 PE 历史（决策引擎估值维度使用，≥200 条才参与）
+    """
     last = price.iloc[-1]
     pe = val_latest.get("pe") if val_latest else np.nan
     pb = val_latest.get("pb") if val_latest else np.nan
     dy = val_latest.get("dy") if val_latest else np.nan
     pe_windows = calc_pe_windows(pe_series)
     w_main = pe_windows.get(PE_MAIN_WINDOW) if pe_windows else None
-    pe_pct = w_main["pct"] if w_main else np.nan  # 主信号分位（近3年）
+    pe_pct = w_main["pct"] if w_main else np.nan  # 展示用主分位（近3年，估算口径）
     pe_pcts, pe_dates = [], []
     if pe_series is not None and len(pe_series) > 1:
         # 近3年滚动窗口分位走势（750 交易日窗口逐点）
@@ -418,10 +429,33 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
             pe_pcts.append(round(percentile_of(w, float(v.iloc[i])), 1))
             pe_dates.append(str(idx[i].date()))
 
+    # ---- V3 决策引擎：趋势 × 估值 × 风险 ----
+    close = float(last["close"])
+    slope_ma20 = None
+    if not np.isnan(last.get("ma20")) and len(price) >= 6 and not np.isnan(price["ma20"].iloc[-6]):
+        slope_ma20 = float(last["ma20"] - price["ma20"].iloc[-6])
+    trend = decision_engine.trend_state(
+        None if np.isnan(last.get("ma20")) else float(last["ma20"]),
+        None if np.isnan(last.get("ma60")) else float(last["ma60"]),
+        None if np.isnan(last.get("ma120")) else float(last["ma120"]),
+        slope_ma20)
+    # 官方 PE 积累数与分位（决策用）
+    official_count = 0
+    if pe_hist_official is not None and not pe_hist_official.empty:
+        official_count = int(pe_hist_official["pe"].dropna().shape[0])
+    official_windows = decision_engine.official_pe_windows(pe_hist_official)
+    ow_main = official_windows.get(PE_MAIN_WINDOW) if official_windows else None
+    val = decision_engine.valuation_state(ow_main["pct"] if ow_main else None, official_count)
+    risk_raw = decision_engine.risk_metrics(price["close"], price["high"], price["low"])
+    risk = decision_engine.risk_state(risk_raw, trend)
+    decision = decision_engine.decide(trend, val, risk, official_count)
+    batch = decision_engine.batch_plan(trend, risk, val)
+    atr = decision_engine.atr_ref(close, risk_raw.get("atr"))
+
     score = 0.0
     signals = []
 
-    # ---- 估值 ----
+    # ---- 估值（展示）----
     if not np.isnan(pe_pct):
         if pe_pct < TH["pe_low"]:
             score += 2; signals.append(f"估值低估·3年分位{pe_pct:.0f}%")
@@ -429,6 +463,8 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
             score -= 2; signals.append(f"估值高估·3年分位{pe_pct:.0f}%")
         else:
             signals.append(f"估值中性·3年分位{pe_pct:.0f}%")
+    if official_count < decision_engine.PE_MIN_OFFICIAL:
+        signals.append(f"官方PE积累中({official_count}条)")
 
     # ---- 技术面 ----
     rsi = float(last.get("rsi")) if not np.isnan(last.get("rsi")) else np.nan
@@ -440,7 +476,6 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
         else:
             signals.append(f"RSI中性({rsi:.0f})")
 
-    close = float(last["close"])
     if not np.isnan(last.get("boll_low")) and close < last["boll_low"]:
         score += 1; signals.append("跌破布林下轨")
     elif not np.isnan(last.get("boll_up")) and close > last["boll_up"]:
@@ -458,13 +493,13 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
     elif dev20 > TH["dev"]:
         score -= 0.5; signals.append(f"偏离20日线{dev20:.1f}%(超涨)")
 
-    # ---- 长期趋势过滤 ----
+    # ---- 长期趋势过滤（V2 保留）----
     ma60, ma120 = last.get("ma60", np.nan), last.get("ma120", np.nan)
     downtrend = pd.notna(ma60) and pd.notna(ma120) and ma60 < ma120
     if downtrend and score >= 0.5:
         signals.append("长期趋势过滤：MA60低于MA120，限制买入信号")
 
-    # ---- 结论 ----
+    # ---- 结论（V2 保留作为信号标签；V3 主建议见 decision.suggestion）----
     if score >= 2.5 and not downtrend:
         conclusion, concl_color, concl_txt = "强烈分批买入", "#ef4444", "估值与技术双低区域，分批建仓/加仓，严控单笔仓位"
     elif score >= 0.5:
@@ -474,15 +509,20 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
     else:
         conclusion, concl_color, concl_txt = "逢高减仓", "#3b82f6", "偏高位区域，分批止盈/减仓，落袋为安"
 
-    # ---- 定投档位（按 PE 分位）----
-    if np.isnan(pe_pct):
+    # ---- 定投档位（V3：优先官方PE分位；官方积累不足时按正常定投）----
+    ow_pct = ow_main["pct"] if ow_main else None
+    dca_ref = ow_pct if ow_pct is not None else (pe_pct if not np.isnan(pe_pct) else None)
+    if official_count < decision_engine.PE_MIN_OFFICIAL:
         dca = "数据积累中，先按正常定投"
         dca_color = "#94a3b8"
-    elif pe_pct < 20:
+    elif dca_ref is None:
+        dca = "数据积累中，先按正常定投"
+        dca_color = "#94a3b8"
+    elif dca_ref < 20:
         dca, dca_color = "双倍定投(2×)", "#ef4444"
-    elif pe_pct < 40:
+    elif dca_ref < 40:
         dca, dca_color = "正常定投(1×)", "#f97316"
-    elif pe_pct < 70:
+    elif dca_ref < 70:
         dca, dca_color = "减半定投(0.5×)", "#eab308"
     else:
         dca, dca_color = "暂停定投·仅持有", "#3b82f6"
@@ -527,7 +567,7 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
         "pb": None if np.isnan(pb) else round(float(pb), 2),
         "dy": None if np.isnan(dy) else round(float(dy), 2),
         "pe_pct": None if np.isnan(pe_pct) else round(pe_pct, 1),
-        "pe_windows": pe_windows,   # {近1年/近3年/近5年: {pct,n,start,end}}
+        "pe_windows": pe_windows,   # {近1年/近3年/近5年: {pct,n,start,end}}（估算口径，展示）
         "pe_pcts": pe_pcts, "pe_dates": pe_dates,
         "signals": signals,
         "score": round(score, 1),
@@ -536,6 +576,17 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
         "support": support, "pressure": pressure, "t_text": t_text,
         "long_txt": long_txt,
         "latest_date": str(price["date"].iloc[-1].date()),
+        # ---- V3 决策简报 ----
+        "official_pe_count": official_count,
+        "official_pe_windows": official_windows,   # 官方积累 PE 分位（决策用）
+        "decision": decision,   # {score(0-100), quality, suggestion, sug_color, reasons, trend, risk, val}
+        "trend": trend,         # {label, score, desc}
+        "risk": risk,           # {label, score, desc, available}
+        "risk_raw": {"atr": risk_raw.get("atr"), "atr_pct": risk_raw.get("atr_pct"),
+                     "adx": risk_raw.get("adx"), "vol20_ann": risk_raw.get("vol20_ann"),
+                     "dd60": risk_raw.get("dd60"), "dd120": risk_raw.get("dd120")},
+        "batch": batch,         # {status, color, text, steps?}
+        "atr_ref": atr,         # {atr, ref_low, ref_high, watch_low, watch_high, text}
     }
 
 
@@ -712,6 +763,14 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list, macro: dict = None):
   .macro-item .v {{ font-weight:600; font-size:13px; line-height:1.6; }}
   .macro-item .v.ok {{ color:#4ade80; }} .macro-item .v.warn {{ color:#fbbf24; }}
   .macro-note {{ margin-top:8px; }}
+  .decision-card {{ grid-column:span 3; }}
+  .dc-row {{ display:flex; gap:12px; flex-wrap:wrap; margin:10px 0 4px; }}
+  .dc-block {{ flex:1; min-width:210px; background:rgba(255,255,255,0.03); border:1px solid var(--line);
+               border-radius:8px; padding:10px 12px; }}
+  .dc-block .k {{ display:block; color:var(--sub); font-size:11px; margin-bottom:5px; }}
+  .dc-block .v {{ font-weight:600; font-size:13px; line-height:1.6; }}
+  .scorebar {{ height:8px; border-radius:4px; background:#232c46; margin:6px 0; overflow:hidden; }}
+  .scorebar > div {{ height:100%; border-radius:4px; }}
   .etf-grid {{ grid-template-columns:repeat(3,1fr); }}
   .price-charts {{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:14px; }}
   .tall {{ height:300px; }}
@@ -764,6 +823,14 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list, macro: dict = None):
   </div>
   </div>
 
+  <!-- V3 交易决策简报：综合评分 / 数据完整度 / 趋势 / 风险 / 建议 / 分批纪律 / ATR参考 -->
+  <div class="grid">
+  <div class="card decision-card">
+    <h3>交易决策简报 <span class="code">综合评分0-100 · 趋势×估值×风险三维 · 每日自动更新</span></h3>
+    <div id="decision-brief"></div>
+  </div>
+  </div>
+
   <!-- 三只 ETF 卡片 -->
   <div class="grid etf-grid" id="etf-cards"></div>
 
@@ -798,7 +865,10 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list, macro: dict = None):
   <div class="foot">
     数据来源：东方财富/腾讯/新浪（行情）· 中证指数官网（官方估值）· 英为财情（国债利率）· 央行（LPR）· 腾讯指数（两市成交）<br>
     PE分位口径：近1年250交易日 / 近3年750 / 近5年1250，样本数为窗口内实际交易日；主信号取近3年。<br>
-    PE 历史序列为估算口径（官方最新PE × 指数点位比例回推，近约20个交易日为官方真实值），分位供相对估值参考。<br>
+    PE 历史序列为估算口径（官方最新PE × 指数点位比例回推，近约20个交易日为官方真实值），分位仅供相对估值参考。<br>
+    V3 决策：估值维度仅使用积累库中证官方PE（≥200条有效记录）参与综合评分，样本不足时该维度标注"数据不足"、不参与决策；<br>
+    长期趋势向下或风险过高时不因 RSI 超卖 / PE 低估直接给出强烈买入；综合评分 = 趋势30% × 估值40% × 风险30%（估值缺失时趋势/风险对半）。<br>
+    分批纪律（40/30/30）与 ATR 参考价位为执行参考，非自动止损指令、非保证成交价；回测结果见 backtest.py（信号次日生效，含手续费+滑点）。<br>
     宏观指标为每日自动采集（利率/情绪）与手动维护条目（政策风向）的组合，仅供环境参考。<br>
     本工具仅作数据监测与量化参考，不构成投资建议。市场有风险，投资需谨慎。
   </div>
@@ -872,6 +942,59 @@ if (R) {{
   window.addEventListener('resize', () => rc.resize());
 }}
 
+/* V3 交易决策简报 */
+function briefColor(score) {{
+  if (score === null || score === undefined) return '#94a3b8';
+  if (score >= 70) return '#ef4444';
+  if (score >= 55) return '#f97316';
+  if (score >= 40) return '#eab308';
+  return '#3b82f6';
+}}
+(function () {{
+  const wrap = document.getElementById('decision-brief');
+  if (!wrap) return;
+  DATA.etfs.forEach(e => {{
+    const d = e.decision || {{}};
+    const sc = d.score;
+    const barColor = briefColor(sc);
+    const trendTxt = e.trend && e.trend.label ? e.trend.label : '--';
+    const riskTxt = e.risk && e.risk.label ? e.risk.label : '--';
+    const valTxt = d.val || '--';
+    const batchTxt = e.batch ? e.batch.text : '--';
+    const reasons = (d.reasons || []).join(' ｜ ');
+    const stepsHtml = e.batch && e.batch.steps
+      ? e.batch.steps.map(s => `<span class="chip">${{s.phase}} ${{s.ratio}}：${{s.trigger}}</span>`).join('')
+      : '';
+    const atrTxt = e.atr_ref && e.atr_ref.text ? e.atr_ref.text : '--';
+    wrap.insertAdjacentHTML('beforeend', `
+      <div class="dc-row" style="border-top:3px solid ${{e.color}};padding-top:8px">
+        <div class="dc-block" style="flex:0 0 160px">
+          <span class="k">${{e.name}} ${{e.code}}</span>
+          <span class="v">综合评分 <b style="font-size:20px;color:${{barColor}}">${{sc===null||sc===undefined?'--':sc}}</b><span style="font-size:11px;color:var(--sub)">/100</span></span>
+          <div class="scorebar"><div style="width:${{sc===null||sc===undefined?0:sc}}%;background:${{barColor}}"></div></div>
+          <span style="font-size:11px;color:var(--sub)">数据完整度 ${{d.quality===undefined||d.quality===null?'--':d.quality+'%'}} · 官方PE ${{e.official_pe_count}}条</span>
+        </div>
+        <div class="dc-block">
+          <span class="k">趋势 / 估值 / 风险</span>
+          <span class="v">${{trendTxt}} · ${{valTxt}} · ${{riskTxt}}</span>
+          <span class="k" style="margin-top:4px">主要判断依据</span>
+          <span class="v" style="font-weight:400;font-size:12px;line-height:1.6">${{reasons||'--'}}</span>
+        </div>
+        <div class="dc-block">
+          <span class="k">当前建议</span>
+          <span class="v" style="color:${{d.sug_color||'#94a3b8'}}">${{d.suggestion||'--'}}</span>
+          <span class="k" style="margin-top:4px">分批纪律</span>
+          <span class="v" style="font-weight:400;font-size:12px">${{batchTxt}}</span>
+          ${{stepsHtml?`<div class="chips" style="margin-top:4px">${{stepsHtml}}</div>`:''}}
+        </div>
+        <div class="dc-block">
+          <span class="k">ATR 参考价位</span>
+          <span class="v" style="font-weight:400;font-size:12px;line-height:1.6">${{atrTxt}}</span>
+        </div>
+      </div>`);
+  }});
+}})();
+
 /* ETF 卡片 */
 function fmtNum(v, d=2) {{ return v===null||v===undefined ? '--' : Number(v).toFixed(d); }}
 const cardsEl = document.getElementById('etf-cards');
@@ -889,6 +1012,14 @@ DATA.etfs.forEach(e => {{
     : '--';
   const supp = e.support.length ? e.support.map(x=>fmtNum(x,3)).join(' / ') : '--';
   const pres = e.pressure.length ? e.pressure.map(x=>fmtNum(x,3)).join(' / ') : '--';
+  const d = e.decision || {{}};
+  const sc = d.score;
+  const bannerTxt = (d.suggestion || e.conclusion) + (sc===null||sc===undefined ? '' : `（综合评分 ${{sc}}）`);
+  const bannerColor = d.sug_color || e.concl_color;
+  const trendTxt2 = e.trend && e.trend.label ? e.trend.label : '--';
+  const riskTxt2 = e.risk && e.risk.label ? e.risk.label : '--';
+  const atrTxt2 = (e.atr_ref && e.atr_ref.ref_low !== undefined && e.atr_ref.ref_high !== undefined)
+    ? e.atr_ref.ref_low + '~' + e.atr_ref.ref_high : '--';
   cardsEl.insertAdjacentHTML('beforeend', `
     <div class="card" style="border-top:3px solid ${{e.color}}">
       <h3>${{e.name}} <span class="code">${{e.code}}</span></h3>
@@ -902,10 +1033,12 @@ DATA.etfs.forEach(e => {{
         <span class="k">RSI(14)</span><span class="v">${{fmtNum(e.rsi,0)}}</span>
         <span class="k">MA20 / MA60</span><span class="v">${{fmtNum(e.ma20,3)}} / ${{fmtNum(e.ma60,3)}}</span>
         <span class="k">偏离20日线</span><span class="v">${{e.dev20>0?'+':''}}${{e.dev20.toFixed(1)}}%</span>
+        <span class="k">趋势 / 风险</span><span class="v">${{trendTxt2}} · ${{riskTxt2}}</span>
+        <span class="k">ATR参考区间</span><span class="v">${{atrTxt2}}</span>
         <span class="k">做T支撑/压力</span><span class="v">${{supp}} / ${{pres}}</span>
       </div>
       <div class="chips">${{e.signals.map(s=>`<span class="chip">${{s}}</span>`).join('')}}</div>
-      <div class="banner" style="background:${{e.concl_color}}22;color:${{e.concl_color}}">${{e.conclusion}}（评分 ${{e.score}}）—— ${{e.concl_txt}}</div>
+      <div class="banner" style="background:${{bannerColor}}22;color:${{bannerColor}}">${{bannerTxt}}</div>
       <div class="mini">定投：<b style="color:${{e.dca_color}}">${{e.dca}}</b> ｜ ${{e.t_text}}</div>
       <div class="mini" style="margin-top:6px">长期：${{e.long_txt}}</div>
     </div>`);
@@ -1060,7 +1193,10 @@ def main():
             badges[2]["ok"] = False
             log(f"{name} 日频PE序列不足(样本{0 if pe_series is None else len(pe_series)})，分位不可用")
 
-        sig = build_signal(name, cfg, price_df, val_latest, pe_series)
+        # 官方 PE 积累历史（V3 决策引擎估值维度：仅 ≥200 条有效记录参与）
+        pe_hist_official = sub_acc.dropna(subset=["pe"]).copy() if sub_acc is not None and not sub_acc.empty else None
+
+        sig = build_signal(name, cfg, price_df, val_latest, pe_series, pe_hist_official)
         # 图表数据
         tail = price_df.tail(250)
         sig["dates"] = [str(d.date()) for d in tail["date"]]
@@ -1074,8 +1210,28 @@ def main():
         p1 = w.get("近1年") or {}
         p3 = w.get("近3年") or {}
         p5 = w.get("近5年") or {}
+        d = sig["decision"] or {}
         log(f"{name}: 收盘 {sig['close']:.3f} | PE {sig['pe']} 分位 1Y {p1.get('pct')}% / "
-            f"3Y {p3.get('pct')}% / 5Y {p5.get('pct')}% (n={p1.get('n')}/{p3.get('n')}/{p5.get('n')}) | 结论 {sig['conclusion']}")
+            f"3Y {p3.get('pct')}% / 5Y {p5.get('pct')}% (n={p1.get('n')}/{p3.get('n')}/{p5.get('n')}) | "
+            f"官方PE {sig['official_pe_count']}条 | 决策 {d.get('score')}分[{d.get('quality')}%] {d.get('suggestion')}")
+
+        # V3：输出价格历史 CSV（供 backtest.py 回测，每日运行自动积累）
+        try:
+            hist_csv = OUT_DIR / f"price_history_{cfg['code']}.csv"
+            prev_df = None
+            if hist_csv.exists():
+                try:
+                    prev_df = pd.read_csv(hist_csv, parse_dates=["date"])
+                except Exception:
+                    prev_df = None
+            cur = price_df[["date", "close"]].copy()
+            cur["date"] = pd.to_datetime(cur["date"])
+            merged = pd.concat([prev_df, cur], ignore_index=True) if prev_df is not None and not prev_df.empty else cur
+            merged = merged.drop_duplicates("date", keep="last").sort_values("date").reset_index(drop=True)
+            merged.to_csv(hist_csv, index=False, encoding="utf-8-sig")
+            log(f"{name}: 价格历史已积累 {len(merged)} 条 -> {hist_csv.name}")
+        except Exception as e:
+            log(f"{name}: 价格历史写盘失败 {e}")
 
     meta["data_date"] = "/".join(sorted(data_dates)) if data_dates else "--"
     meta["badges"] = badges
