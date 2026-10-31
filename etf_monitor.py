@@ -65,7 +65,7 @@ TH = {
     "pe_low": 30, "pe_high": 70,          # PE分位 低估/高估
     "rsi_low": 35, "rsi_high": 70,        # RSI 超卖/超买
     "dev": 5.0,                           # 偏离20日线阈值%
-    "ratio_low": 0.35, "ratio_high": 0.60 # 创业板红利比 阈值
+    "ratio_low": 0.35, "ratio_high": 0.60 # （V2 起弃用：创业板红利比改用归一化相对强弱 + 分位30/70解释，此阈值仅保留）
 }
 
 # 宏观环境阈值（可自行调整）
@@ -109,6 +109,25 @@ def safe_call(name, fn, *args, **kwargs):
     return None
 
 
+def normalize_daily(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    """统一行情字段并检查日期、价格、重复记录。"""
+    if df is None or df.empty:
+        raise ValueError(f"{source}: 空行情")
+    aliases = {"日期":"date", "开盘":"open", "收盘":"close", "最高":"high", "最低":"low",
+               "成交量":"volume", "成交额":"amount", "涨跌幅":"pct_chg"}
+    df = df.rename(columns=aliases).copy()
+    if not {"date", "close"}.issubset(df.columns):
+        raise ValueError(f"{source}: 缺少 date/close 字段")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    for c in ("open", "high", "low", "close", "volume", "amount", "pct_chg"):
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date", "close"])
+    df = df[df["close"] > 0].sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    if df.empty: raise ValueError(f"{source}: 清洗后无有效行情")
+    if "pct_chg" not in df.columns: df["pct_chg"] = df["close"].pct_change() * 100
+    return df
+
+
 # ============================================================
 # 2. 数据获取（东财优先，新浪兜底——海外服务器(如GitHub Actions)访问东财会被拒绝）
 # ============================================================
@@ -118,6 +137,7 @@ def get_etf_daily_em(code: str):
     start = (dt.date.today() - dt.timedelta(days=int(PRICE_YEARS * 365))).strftime("%Y%m%d")
     df = ak.fund_etf_hist_em(symbol=code, period="daily",
                              start_date=start, end_date=end, adjust="qfq")
+    return normalize_daily(df, "东方财富ETF")
 
 
 def get_etf_daily_sina(code: str):
@@ -126,10 +146,7 @@ def get_etf_daily_sina(code: str):
     df = ak.fund_etf_hist_sina(symbol=f"{prefix}{code}")
     df = df.rename(columns={"日期": "date", "开盘": "open", "收盘": "close",
                             "最高": "high", "最低": "low"})
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    df["pct_chg"] = df["close"].pct_change() * 100
-    return df
+    return normalize_daily(df, "备用行情")
 
 
 def get_etf_daily_tx(code: str):
@@ -138,10 +155,7 @@ def get_etf_daily_tx(code: str):
     df = ak.stock_zh_a_hist_tx(symbol=f"{prefix}{code}")
     df = df.rename(columns={"date": "date", "open": "open", "close": "close",
                             "high": "high", "low": "low"})
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    df["pct_chg"] = df["close"].pct_change() * 100
-    return df
+    return normalize_daily(df, "备用行情")
 
 
 def get_etf_daily(code: str):
@@ -167,9 +181,7 @@ def get_index_daily_em(code: str):
                             start_date=start, end_date=end)
     df = df.rename(columns={"日期": "date", "开盘": "open", "收盘": "close",
                             "最高": "high", "最低": "low", "涨跌幅": "pct_chg"})
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    return df
+    return normalize_daily(df, "指数行情")
 
 
 def get_index_daily_sina(code: str):
@@ -178,10 +190,7 @@ def get_index_daily_sina(code: str):
     df = ak.stock_zh_index_daily(symbol=f"{prefix}{code}")
     df = df.rename(columns={"date": "date", "open": "open", "close": "close",
                             "high": "high", "low": "low"})
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    df["pct_chg"] = df["close"].pct_change() * 100
-    return df
+    return normalize_daily(df, "备用行情")
 
 
 def get_index_daily_tx(code: str):
@@ -190,10 +199,7 @@ def get_index_daily_tx(code: str):
     df = ak.stock_zh_index_daily_tx(symbol=f"{prefix}{code}")
     df = df.rename(columns={"date": "date", "open": "open", "close": "close",
                             "high": "high", "low": "low"})
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    df["pct_chg"] = df["close"].pct_change() * 100
-    return df
+    return normalize_daily(df, "备用行情")
 
 
 def get_index_daily(code: str):
@@ -222,9 +228,7 @@ def get_index_valuation_csindex(index_code: str):
         df["pb"] = np.nan
     if "dy" not in df.columns:
         df["dy"] = np.nan
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    return df[["date", "pe", "pb", "dy"]]
+    return normalize_daily(df, "指数行情")[["date", "pe", "pb", "dy"]]
 
 
 # ============================================================
@@ -233,16 +237,25 @@ def get_index_valuation_csindex(index_code: str):
 def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """均线 / RSI / BOLL / MACD / 偏离度"""
     df = df.copy()
-    for w in (5, 20, 60):
+    for w in (5, 20, 60, 120):
         df[f"ma{w}"] = df["close"].rolling(w).mean()
     delta = df["close"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = (-delta).where(delta < 0, 0.0)
-    # RSI(14) Wilder 平滑：ewm(alpha=1/14, adjust=False) 近似 SMMA（标准 RSI 口径）
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    df["rsi"] = 100 - (100 / (1 + rs))
+    # RSI(14) Wilder：前14期均值初始化，之后按 Wilder 递推。
+    period = 14
+    avg_gain = pd.Series(np.nan, index=df.index, dtype=float)
+    avg_loss = pd.Series(np.nan, index=df.index, dtype=float)
+    if len(df) > period:
+        avg_gain.iloc[period] = gain.iloc[1:period+1].mean()
+        avg_loss.iloc[period] = loss.iloc[1:period+1].mean()
+        for i in range(period+1, len(df)):
+            avg_gain.iloc[i] = (avg_gain.iloc[i-1]*(period-1)+gain.iloc[i])/period
+            avg_loss.iloc[i] = (avg_loss.iloc[i-1]*(period-1)+loss.iloc[i])/period
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = 100 - 100/(1+rs)
+    df.loc[(avg_loss == 0) & (avg_gain > 0), "rsi"] = 100
+    df.loc[(avg_loss == 0) & (avg_gain == 0), "rsi"] = 50
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["dif"] = ema12 - ema26
@@ -298,7 +311,8 @@ def build_pe_series(price_df, val_latest, acc_hist) -> "pd.Series | None":
             d = pd.to_datetime(row["date"])
             if d in pe_s.index:
                 pe_s.loc[d] = float(row["pe"])
-    pe_s.iloc[-1] = pe0  # 末端对齐官方最新 PE，保证“最新分位=官方值位置”
+    if pd.to_datetime(anchor).date() == pd.to_datetime(pe_s.index[-1]).date():
+        pe_s.iloc[-1] = pe0
     return pe_s
 
 
@@ -312,11 +326,12 @@ def calc_pe_windows(pe_s: "pd.Series | None"):
     out = {}
     for label, n in PE_WINDOWS.items():
         w = pe_s.tail(n)
-        if w.empty:
+        if len(w) < int(n * 0.80):
             out[label] = None
             continue
+        reference = w.iloc[:-1] if len(w) > 1 else w
         out[label] = {
-            "pct": round(percentile_of(w, float(w.iloc[-1])), 1),
+            "pct": round(percentile_of(reference, float(w.iloc[-1])), 1),
             "n": int(len(w)),
             "start": str(w.index[0].date()),
             "end": str(w.index[-1].date()),
@@ -369,11 +384,11 @@ def get_valuation(code: str, name: str, hist: pd.DataFrame):
     if val is not None and not val.empty:
         hist = update_history(hist, code, name, val)
         src = "中证指数官网(官方)"
-    elif hist is not None and not hist[hist["index_code"] == code].empty:
+    elif hist is not None and not hist[hist["index_code"] == str(code).zfill(6)].empty:
         src = "本地积累库(上次数据)"
     else:
         return None, hist, "暂无估值数据"
-    sub = hist[hist["index_code"] == code].sort_values("date")
+    sub = hist[hist["index_code"] == str(code).zfill(6)].sort_values("date")
     if sub.empty:
         return None, hist, src
     latest = sub.iloc[-1].to_dict()
@@ -443,8 +458,14 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
     elif dev20 > TH["dev"]:
         score -= 0.5; signals.append(f"偏离20日线{dev20:.1f}%(超涨)")
 
+    # ---- 长期趋势过滤 ----
+    ma60, ma120 = last.get("ma60", np.nan), last.get("ma120", np.nan)
+    downtrend = pd.notna(ma60) and pd.notna(ma120) and ma60 < ma120
+    if downtrend and score >= 0.5:
+        signals.append("长期趋势过滤：MA60低于MA120，限制买入信号")
+
     # ---- 结论 ----
-    if score >= 2.5:
+    if score >= 2.5 and not downtrend:
         conclusion, concl_color, concl_txt = "强烈分批买入", "#ef4444", "估值与技术双低区域，分批建仓/加仓，严控单笔仓位"
     elif score >= 0.5:
         conclusion, concl_color, concl_txt = "逢低分批买入", "#f97316", "偏低估区域，可分批买入或维持定投"
@@ -499,6 +520,7 @@ def build_signal(name: str, cfg: dict, price: pd.DataFrame, val_latest: dict, pe
         "pct_chg": float(last.get("pct_chg", 0.0)) if not np.isnan(last.get("pct_chg", 0.0)) else 0.0,
         "ma20": float(last["ma20"]) if not np.isnan(last.get("ma20")) else None,
         "ma60": float(last["ma60"]) if not np.isnan(last.get("ma60")) else None,
+        "ma120": float(last["ma120"]) if not np.isnan(last.get("ma120")) else None,
         "rsi": None if np.isnan(rsi) else round(rsi, 1),
         "dev20": round(dev20, 2),
         "pe": None if np.isnan(pe) else round(float(pe), 2),
@@ -578,7 +600,7 @@ def get_macro() -> dict:
         mm = get_mkt_amount()
         if mm is not None and len(mm) >= 21:
             last = float(mm["total"].iloc[-1])
-            avg20 = float(mm["total"].iloc[-21:].mean())
+            avg20 = float(mm["total"].iloc[-21:-1].mean())
             m["mkt"] = last
             m["mkt_ratio"] = last / avg20 if avg20 > 0 else None
             m["mkt_date"] = str(mm["date"].iloc[-1])
@@ -596,18 +618,23 @@ def build_ratio():
         return None
     m = pd.merge(gem[["date", "close"]], div[["date", "close"]],
                  on="date", suffixes=("_gem", "_div"))
-    m["ratio"] = m["close_gem"] / m["close_div"]
     m = m.dropna()
+    m = m[(m["close_gem"] > 0) & (m["close_div"] > 0)].copy()
+    if m.empty:
+        return None
+    m["ratio"] = (m["close_gem"] / m["close_gem"].iloc[0]) / (m["close_div"] / m["close_div"].iloc[0])
     # 仅取近3年样本（与看板“近3年分位”口径一致；腾讯/新浪源返回全量历史）
     m = m.tail(int(HISTORY_YEARS * 250)).reset_index(drop=True)
+    if len(m) < 20:
+        return None
     latest = float(m["ratio"].iloc[-1])
-    pct = percentile_of(m["ratio"], latest)
-    if latest < TH["ratio_low"]:
-        sug, sug_color = "成长风格占优期：创业板相对低估，可增配成长、减配红利", "#f97316"
-    elif latest > TH["ratio_high"]:
-        sug, sug_color = "红利风格占优期：红利相对低估，可增配红利价值、减配成长", "#ef4444"
+    pct = percentile_of(m["ratio"].iloc[:-1], latest)
+    if pct < 30:
+        sug, sug_color = "成长相对表现处于历史低位：观察相对表现，不据此单独交易", "#f97316"
+    elif pct > 70:
+        sug, sug_color = "成长相对表现处于历史高位：观察红利相对表现，不据此单独交易", "#ef4444"
     else:
-        sug, sug_color = "风格均衡期：维持现有配置比例，不追风格", "#94a3b8"
+        sug, sug_color = "相对表现处于历史中段：维持配置纪律", "#94a3b8"
     return {
         "latest": latest, "pct": round(pct, 1), "sug": sug, "sug_color": sug_color,
         "dates": [str(d.date()) for d in m["date"]],
@@ -728,9 +755,9 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list, macro: dict = None):
         <div class="num-row"><span class="big" id="ratio-val">--</span>
           <span style="font-size:13px;color:var(--sub)" id="ratio-pct">--</span></div>
         <div class="ratio-bar"></div>
-        <div class="ratio-mark"><span>&lt;0.35 成长占优</span><span>均衡</span><span>&gt;0.60 红利占优</span></div>
+        <div class="ratio-mark"><span>&lt;30% 成长相对低位</span><span>中段</span><span>&gt;70% 相对高位</span></div>
         <div class="banner" id="ratio-sug" style="margin-top:10px">--</div>
-        <div class="mini">比值=创业板指收盘÷中证红利收盘；分位为近{HISTORY_YEARS}年历史百分位。比值走高=红利相对便宜。</div>
+        <div class="mini">比值=创业板指收盘÷中证红利收盘；分位为近{HISTORY_YEARS}年历史百分位。相对强弱走高=创业板相对中证红利表现更强；分位不代表估值便宜。</div>
       </div>
       <div class="ratio-chart" id="ratio-chart"></div>
     </div>
@@ -758,7 +785,7 @@ def render_dashboard(meta: dict, ratio: dict, etfs: list, macro: dict = None):
     <div class="card"><h3>再平衡</h3><ul class="mini" style="list-style:none">
       <li>· 每半年（6月/12月）强制再平衡一次</li>
       <li>· 单只仓位偏离基准 ±10% 触发调整</li>
-      <li>· 创业板红利比穿越 0.35/0.60 时调整风格配比</li>
+      <li>· 创业板/红利相对强弱分位&lt;30%或&gt;70%时关注风格切换，不据此单独交易</li>
     </ul></div>
     <div class="card"><h3>长期纪律</h3><ul class="mini" style="list-style:none">
       <li>· 煤炭为强周期品种，仓位上限 40%，切忌单吊</li>
@@ -839,8 +866,7 @@ if (R) {{
       lineStyle:{{color:'#a78bfa',width:2}},
       areaStyle:{{color:'rgba(167,139,250,0.12)'}},
       markLine:{{silent:true,symbol:'none',
-        data:[{{yAxis:0.35,label:{{formatter:'0.35 成长占优',color:'#22c55e'}},lineStyle:{{color:'#22c55e',type:'dashed'}}}},
-              {{yAxis:0.60,label:{{formatter:'0.60 红利占优',color:'#ef4444'}},lineStyle:{{color:'#ef4444',type:'dashed'}}}}]}}
+        data:[{{yAxis:1.0,label:{{formatter:'相对基准 1.0',color:'#8a93ab'}},lineStyle:{{color:'#8a93ab',type:'dashed'}}}}]}}
     }}]
   }});
   window.addEventListener('resize', () => rc.resize());
@@ -1027,10 +1053,9 @@ def main():
         #       ETF 价格受分红/复权因子影响会扭曲 PE 回推，故 PE 序列一律基于指数日线。
         idx_df = safe_call(f"{cfg['index_name']}指数行情", get_index_daily, cfg["index_code"])
         if idx_df is None:
-            log(f"{name} 指数日线缺失，PE序列改用ETF行情估算(口径略差)")
-            idx_df = price_df
+            log(f"{name} 指数日线缺失，停止生成日频PE估算，避免复权ETF价格冒充指数点位")
         sub_acc = hist[hist["index_code"] == cfg["index_code"]]
-        pe_series = build_pe_series(idx_df, val_latest, sub_acc)
+        pe_series = build_pe_series(idx_df, val_latest, sub_acc) if idx_df is not None else None
         if pe_series is None or len(pe_series) < 250:
             badges[2]["ok"] = False
             log(f"{name} 日频PE序列不足(样本{0 if pe_series is None else len(pe_series)})，分位不可用")
